@@ -1,6 +1,5 @@
 #include "lantern/networking/reqresp_service.h"
 
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,8 +34,9 @@ struct lantern_reqresp_exchange {
     size_t write_off;
     struct reqresp_buffer read_buf;
     LanternRoot *roots;
+    bool *roots_matched;
     size_t root_count;
-    size_t responses_received;
+    size_t matched_root_count;
     uint64_t request_id;
     int completed;
     int request_complete;
@@ -118,6 +118,7 @@ static void exchange_free(struct lantern_reqresp_exchange *exchange) {
     free(exchange->write_buf);
     reqresp_buffer_reset(&exchange->read_buf);
     free(exchange->roots);
+    free(exchange->roots_matched);
     free(exchange);
 }
 
@@ -179,173 +180,8 @@ static void service_clear_exchanges(struct lantern_reqresp_service *service) {
     }
 }
 
-static ssize_t stream_read(struct lantern_reqresp_stream *stream, void *buf, size_t len) {
-    if (!stream || !buf) {
-        return -EINVAL;
-    }
-    if (stream->ops.read) {
-        return stream->ops.read(stream->io_ctx, buf, len);
-    }
-    if (stream->host && stream->stream) {
-        size_t read_len = 0;
-        int fin = 0;
-        libp2p_host_err_t err =
-            libp2p_host_stream_read(stream->host, stream->stream, buf, len, &read_len, &fin);
-        if (err == LIBP2P_HOST_OK) {
-            if (read_len == 0 && fin) {
-                return 0;
-            }
-            return (ssize_t)read_len;
-        }
-        if (err == LIBP2P_HOST_ERR_WOULD_BLOCK) {
-            return -EAGAIN;
-        }
-        return -EIO;
-    }
-    return -EINVAL;
-}
-
-static ssize_t stream_write(struct lantern_reqresp_stream *stream, const void *buf, size_t len) {
-    if (!stream || (!buf && len != 0)) {
-        return -EINVAL;
-    }
-    if (stream->ops.write) {
-        return stream->ops.write(stream->io_ctx, buf, len);
-    }
-    if (stream->host && stream->stream) {
-        size_t accepted = 0;
-        libp2p_host_err_t err =
-            libp2p_host_stream_write(stream->host, stream->stream, buf, len, 0, &accepted);
-        if (err == LIBP2P_HOST_OK) {
-            return (ssize_t)accepted;
-        }
-        if (err == LIBP2P_HOST_ERR_WOULD_BLOCK) {
-            return -EAGAIN;
-        }
-        return -EIO;
-    }
-    return -EINVAL;
-}
-
-static int stream_set_deadline(struct lantern_reqresp_stream *stream, uint64_t ms) {
-    if (!stream) {
-        return -1;
-    }
-    if (stream->ops.set_deadline) {
-        return stream->ops.set_deadline(stream->io_ctx, ms);
-    }
-    return 0;
-}
-
-static int read_exact(struct lantern_reqresp_stream *stream, uint8_t *buffer, size_t len, ssize_t *out_err) {
-    size_t offset = 0;
-    while (offset < len) {
-        ssize_t n = stream_read(stream, buffer + offset, len - offset);
-        if (n <= 0) {
-            if (out_err) {
-                *out_err = n;
-            }
-            return LANTERN_REQRESP_ERR_STREAM_READ;
-        }
-        offset += (size_t)n;
-    }
-    return LANTERN_REQRESP_OK;
-}
-
 static uint32_t read_le24(const uint8_t bytes[3]) {
     return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8u) | ((uint32_t)bytes[2] << 16u);
-}
-
-static int read_snappy_frame_payload(
-    struct lantern_reqresp_stream *stream,
-    size_t raw_len,
-    uint8_t **out_data,
-    size_t *out_len,
-    ssize_t *out_err) {
-    size_t max_payload = 0;
-    if (lantern_snappy_max_compressed_size(raw_len, &max_payload) != LANTERN_SNAPPY_OK
-        || max_payload < (size_t)LANTERN_SNAPPY_FRAME_STREAM_HEADER_BYTES) {
-        return LANTERN_REQRESP_ERR_PAYLOAD_TOO_LARGE;
-    }
-
-    uint8_t *payload = (uint8_t *)malloc(max_payload);
-    if (!payload) {
-        return LANTERN_REQRESP_ERR_ALLOC;
-    }
-
-    size_t len = 0;
-    int rc = read_exact(stream, payload, (size_t)LANTERN_SNAPPY_FRAME_STREAM_HEADER_BYTES, out_err);
-    if (rc != LANTERN_REQRESP_OK) {
-        free(payload);
-        return rc;
-    }
-    len = (size_t)LANTERN_SNAPPY_FRAME_STREAM_HEADER_BYTES;
-
-    size_t decoded_total = 0;
-    if (!lantern_snappy_is_framed(payload, len)
-        || lantern_snappy_uncompressed_length(payload, len, &decoded_total) != LANTERN_SNAPPY_OK
-        || decoded_total > raw_len) {
-        free(payload);
-        return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
-    }
-
-    while (decoded_total < raw_len) {
-        if (max_payload - len < (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES) {
-            free(payload);
-            return LANTERN_REQRESP_ERR_PAYLOAD_TOO_LARGE;
-        }
-
-        size_t chunk_start = len;
-        rc = read_exact(
-            stream,
-            payload + len,
-            (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES,
-            out_err);
-        if (rc != LANTERN_REQRESP_OK) {
-            free(payload);
-            return rc;
-        }
-        len += (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES;
-
-        size_t chunk_len = (size_t)read_le24(payload + chunk_start + 1u);
-        if (chunk_len > max_payload - len) {
-            free(payload);
-            return LANTERN_REQRESP_ERR_PAYLOAD_TOO_LARGE;
-        }
-        rc = read_exact(stream, payload + len, chunk_len, out_err);
-        if (rc != LANTERN_REQRESP_OK) {
-            free(payload);
-            return rc;
-        }
-
-        len += chunk_len;
-        if (lantern_snappy_uncompressed_length(payload, len, &decoded_total) != LANTERN_SNAPPY_OK
-            || decoded_total > raw_len) {
-            free(payload);
-            return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
-        }
-    }
-
-    uint8_t *scratch = NULL;
-    if (raw_len > 0u) {
-        scratch = (uint8_t *)malloc(raw_len);
-        if (!scratch) {
-            free(payload);
-            return LANTERN_REQRESP_ERR_ALLOC;
-        }
-    }
-    size_t written = 0;
-    if (lantern_snappy_decompress(payload, len, scratch, raw_len, &written) != LANTERN_SNAPPY_OK
-        || written != raw_len) {
-        free(scratch);
-        free(payload);
-        return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
-    }
-    free(scratch);
-
-    *out_data = payload;
-    *out_len = len;
-    return LANTERN_REQRESP_OK;
 }
 
 static int snappy_frame_payload_len(
@@ -900,18 +736,19 @@ static int exchange_flush_write(struct lantern_reqresp_exchange *exchange) {
         return -1;
     }
     while (exchange->write_off < exchange->write_len) {
-        ssize_t n = stream_write(
-            (struct lantern_reqresp_stream *)&(struct lantern_reqresp_stream){
-                .host = exchange->host,
-                .stream = exchange->stream,
-            },
+        size_t accepted = 0;
+        libp2p_host_err_t err = libp2p_host_stream_write(
+            exchange->host,
+            exchange->stream,
             exchange->write_buf + exchange->write_off,
-            exchange->write_len - exchange->write_off);
-        if (n > 0) {
-            exchange->write_off += (size_t)n;
+            exchange->write_len - exchange->write_off,
+            0,
+            &accepted);
+        if (err == LIBP2P_HOST_OK && accepted > 0u) {
+            exchange->write_off += accepted;
             continue;
         }
-        if (n == -EAGAIN) {
+        if (err == LIBP2P_HOST_ERR_WOULD_BLOCK) {
             return 0;
         }
         return -1;
@@ -954,12 +791,54 @@ static int exchange_read_available(struct lantern_reqresp_exchange *exchange, in
     }
 }
 
-static void exchange_fail(struct lantern_reqresp_exchange *exchange, int error) {
+static bool exchange_blocks_request_success(const struct lantern_reqresp_exchange *exchange) {
+    return exchange && exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT
+        && exchange->roots_matched
+        && exchange->root_count > 0u
+        && exchange->matched_root_count == exchange->root_count;
+}
+
+static bool exchange_find_unmatched_root_index(
+    const struct lantern_reqresp_exchange *exchange,
+    const LanternRoot *root,
+    size_t *out_index) {
+    if (!exchange || !root || !exchange->roots || !exchange->roots_matched) {
+        return false;
+    }
+    for (size_t i = 0; i < exchange->root_count; ++i) {
+        if (!exchange->roots_matched[i]
+            && memcmp(exchange->roots[i].bytes, root->bytes, LANTERN_ROOT_SIZE) == 0) {
+            if (out_index) {
+                *out_index = i;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void exchange_complete_blocks_request(struct lantern_reqresp_exchange *exchange, int success) {
     if (!exchange || exchange->completed) {
         return;
     }
     exchange->completed = 1;
+    if (exchange->service->callbacks.blocks_request_complete) {
+        exchange->service->callbacks.blocks_request_complete(
+            exchange->service->callbacks.context,
+            exchange->peer_id_text,
+            exchange->roots,
+            exchange->root_count,
+            exchange->request_id,
+            success);
+    }
+}
+
+static void exchange_fail(struct lantern_reqresp_exchange *exchange, int error) {
+    if (!exchange || exchange->completed) {
+        return;
+    }
     if (exchange->outbound && exchange->kind == LANTERN_REQRESP_PROTOCOL_STATUS) {
+        exchange->completed = 1;
         if (exchange->service->callbacks.status_failure) {
             exchange->service->callbacks.status_failure(
                 exchange->service->callbacks.context,
@@ -967,16 +846,21 @@ static void exchange_fail(struct lantern_reqresp_exchange *exchange, int error) 
                 error);
         }
     } else if (exchange->outbound && exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT) {
-        if (exchange->service->callbacks.blocks_request_complete) {
-            exchange->service->callbacks.blocks_request_complete(
-                exchange->service->callbacks.context,
-                exchange->peer_id_text,
-                exchange->roots,
-                exchange->root_count,
-                exchange->request_id,
-                exchange->responses_received > 0u ? 1 : 0);
-        }
+        exchange_complete_blocks_request(exchange, 0);
+    } else {
+        exchange->completed = 1;
     }
+}
+
+static void exchange_handle_outbound_closed(struct lantern_reqresp_exchange *exchange, bool reset) {
+    if (!exchange || !exchange->outbound || exchange->completed) {
+        return;
+    }
+    if (!reset && exchange_blocks_request_success(exchange)) {
+        exchange_complete_blocks_request(exchange, 1);
+        return;
+    }
+    exchange_fail(exchange, LANTERN_REQRESP_ERR_STREAM_READ);
 }
 
 static int exchange_handle_outbound_status_frame(
@@ -1029,30 +913,34 @@ static int exchange_handle_outbound_block_frame(
         exchange_fail(exchange, LANTERN_REQRESP_ERR_INVALID_PAYLOAD);
         return 0;
     }
+    size_t root_index = 0;
+    if (exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT) {
+        LanternRoot block_root = {0};
+        if (lantern_hash_tree_root_block(&block.block, &block_root) != SSZ_SUCCESS
+            || !exchange_find_unmatched_root_index(exchange, &block_root, &root_index)) {
+            lantern_signed_block_reset(&block);
+            exchange_fail(exchange, LANTERN_REQRESP_ERR_INVALID_PAYLOAD);
+            return 0;
+        }
+    }
     int handled = 0;
     if (exchange->service->callbacks.handle_block_response) {
         handled = exchange->service->callbacks.handle_block_response(
             exchange->service->callbacks.context,
             &block,
-            raw,
-            raw_len,
             exchange->peer_id_text);
     }
     lantern_signed_block_reset(&block);
     if (handled == 0) {
-        exchange->responses_received += 1u;
-        if (exchange->responses_received >= exchange->root_count) {
-            exchange->completed = 1;
-            if (exchange->service->callbacks.blocks_request_complete) {
-                exchange->service->callbacks.blocks_request_complete(
-                    exchange->service->callbacks.context,
-                    exchange->peer_id_text,
-                    exchange->roots,
-                    exchange->root_count,
-                    exchange->request_id,
-                    1);
-            }
+        if (exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT) {
+            exchange->roots_matched[root_index] = true;
         }
+        exchange->matched_root_count += 1u;
+        if (exchange_blocks_request_success(exchange)) {
+            exchange_complete_blocks_request(exchange, 1);
+        }
+    } else {
+        exchange_fail(exchange, handled);
     }
     return 0;
 }
@@ -1194,23 +1082,10 @@ static libp2p_host_err_t reqresp_on_event(
     }
     struct lantern_reqresp_exchange *exchange = (struct lantern_reqresp_exchange *)user_data;
     if (kind == LIBP2P_HOST_PROTOCOL_EVENT_RESET || kind == LIBP2P_HOST_PROTOCOL_EVENT_CLOSED) {
-        if (exchange->outbound && !exchange->completed) {
-            if (kind == LIBP2P_HOST_PROTOCOL_EVENT_RESET) {
-                exchange_fail(exchange, LANTERN_REQRESP_ERR_STREAM_READ);
-            } else if (exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT && exchange->responses_received > 0u) {
-                exchange->completed = 1;
-                if (exchange->service->callbacks.blocks_request_complete) {
-                    exchange->service->callbacks.blocks_request_complete(
-                        exchange->service->callbacks.context,
-                        exchange->peer_id_text,
-                        exchange->roots,
-                        exchange->root_count,
-                        exchange->request_id,
-                        1);
-                }
-            } else {
-                exchange_fail(exchange, LANTERN_REQRESP_ERR_STREAM_READ);
-            }
+        if (exchange->outbound) {
+            exchange_handle_outbound_closed(
+                exchange,
+                kind == LIBP2P_HOST_PROTOCOL_EVENT_RESET);
         }
         service_remove_exchange(exchange->service, exchange);
         exchange_free(exchange);
@@ -1264,10 +1139,6 @@ static void reqresp_host_event(
         exchange_fail(exchange, (int)event->reason);
         exchange_free(exchange);
     }
-}
-
-uint32_t lantern_reqresp_stall_timeout_ms(void) {
-    return LANTERN_REQRESP_STALL_TIMEOUT_MS;
 }
 
 void lantern_reqresp_service_init(struct lantern_reqresp_service *service) {
@@ -1389,12 +1260,21 @@ static int service_open_exchange(
             peer_id_text);
     }
     if (root_count > 0u) {
+        if (!roots) {
+            exchange_free(exchange);
+            return -1;
+        }
         exchange->roots = (LanternRoot *)calloc(root_count, sizeof(*exchange->roots));
         if (!exchange->roots) {
             exchange_free(exchange);
             return -1;
         }
         memcpy(exchange->roots, roots, root_count * sizeof(*exchange->roots));
+        exchange->roots_matched = (bool *)calloc(root_count, sizeof(*exchange->roots_matched));
+        if (!exchange->roots_matched) {
+            exchange_free(exchange);
+            return -1;
+        }
         exchange->root_count = root_count;
     }
     service_add_exchange(service, exchange);
@@ -1479,100 +1359,4 @@ int lantern_reqresp_service_request_blocks(
         roots,
         root_count,
         request_id);
-}
-
-struct lantern_reqresp_stream *lantern_reqresp_stream_from_ops(
-    void *io_ctx,
-    const struct lantern_reqresp_stream_ops *ops,
-    const struct lantern_peer_id *remote_peer) {
-    if (!ops) {
-        return NULL;
-    }
-    struct lantern_reqresp_stream *stream = (struct lantern_reqresp_stream *)calloc(1u, sizeof(*stream));
-    if (!stream) {
-        return NULL;
-    }
-    stream->io_ctx = io_ctx;
-    stream->ops = *ops;
-    if (remote_peer) {
-        stream->remote_peer = *remote_peer;
-        stream->has_remote_peer = true;
-    }
-    return stream;
-}
-
-void lantern_reqresp_stream_free(struct lantern_reqresp_stream *stream) {
-    if (!stream) {
-        return;
-    }
-    if (stream->ops.free_ctx) {
-        stream->ops.free_ctx(stream->io_ctx);
-    }
-    free(stream);
-}
-
-int lantern_reqresp_read_response_chunk(
-    struct lantern_reqresp_service *service,
-    struct lantern_reqresp_stream *stream,
-    enum lantern_reqresp_protocol_kind protocol,
-    uint8_t **out_data,
-    size_t *out_len,
-    ssize_t *out_err,
-    uint8_t *out_response_code,
-    bool *response_code_pending) {
-    (void)service;
-    (void)protocol;
-    if (!stream || !out_data || !out_len) {
-        return LANTERN_REQRESP_ERR_INVALID_PARAM;
-    }
-    *out_data = NULL;
-    *out_len = 0;
-    if (out_err) {
-        *out_err = 0;
-    }
-
-    if (stream_set_deadline(stream, lantern_reqresp_stall_timeout_ms()) != 0) {
-        return LANTERN_REQRESP_ERR_SET_DEADLINE;
-    }
-
-    bool need_response_code = response_code_pending ? *response_code_pending : true;
-    if (need_response_code) {
-        uint8_t code = 0;
-        int rc = read_exact(stream, &code, 1u, out_err);
-        if (rc != LANTERN_REQRESP_OK) {
-            return rc;
-        }
-        if (out_response_code) {
-            *out_response_code = normalize_response_code(code);
-        }
-        if (response_code_pending) {
-            *response_code_pending = false;
-        }
-    }
-
-    uint8_t header[LANTERN_REQRESP_HEADER_MAX_BYTES];
-    size_t header_len = 0;
-    uint64_t payload_len = 0;
-    for (;;) {
-        if (header_len >= sizeof(header)) {
-            return LANTERN_REQRESP_ERR_VARINT_HEADER_TOO_LONG;
-        }
-        int rc = read_exact(stream, &header[header_len], 1u, out_err);
-        if (rc != LANTERN_REQRESP_OK) {
-            return rc;
-        }
-        header_len++;
-        size_t consumed = 0;
-        libp2p_uvarint_err_t err = libp2p_uvarint_decode(header, header_len, &payload_len, &consumed);
-        if (err == LIBP2P_UVARINT_OK && consumed == header_len) {
-            break;
-        }
-        if (err != LIBP2P_UVARINT_ERR_TRUNCATED) {
-            return LANTERN_REQRESP_ERR_VARINT_HEADER_TOO_LONG;
-        }
-    }
-    if (payload_len > LANTERN_REQRESP_MAX_CHUNK_BYTES) {
-        return LANTERN_REQRESP_ERR_PAYLOAD_TOO_LARGE;
-    }
-    return read_snappy_frame_payload(stream, (size_t)payload_len, out_data, out_len, out_err);
 }

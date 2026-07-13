@@ -20,7 +20,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <inttypes.h>
 
 #include "lantern/networking/libp2p.h"
@@ -235,6 +234,24 @@ static bool connection_peer_matches(
     return ref && peer && lantern_peer_id_equal(&ref->peer, peer);
 }
 
+static bool connection_peer_exists_locked(
+    const struct lantern_client *client,
+    const struct lantern_peer_id *peer)
+{
+    if (!client || !peer)
+    {
+        return false;
+    }
+    for (size_t i = 0; i < client->connection_peer_ref_count; ++i)
+    {
+        if (connection_peer_matches(&client->connection_peer_refs[i], peer))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool connection_dedup_collect_closures(
     struct lantern_client *client,
     const void *conn,
@@ -421,36 +438,18 @@ void connection_counter_reset(struct lantern_client *client)
     if (!client->connection_lock_initialized)
     {
         client->connected_peers = 0;
-        lantern_string_list_reset(&client->connected_peer_ids);
-        lantern_string_list_init(&client->connected_peer_ids);
-        lantern_string_list_reset(&client->connected_peer_refs);
-        lantern_string_list_init(&client->connected_peer_refs);
-        lantern_string_list_reset(&client->inbound_peer_ids);
-        lantern_string_list_init(&client->inbound_peer_ids);
         connection_peer_refs_reset_locked(client);
         return;
     }
     if (pthread_mutex_lock(&client->connection_lock) == 0)
     {
         client->connected_peers = 0;
-        lantern_string_list_reset(&client->connected_peer_ids);
-        lantern_string_list_init(&client->connected_peer_ids);
-        lantern_string_list_reset(&client->connected_peer_refs);
-        lantern_string_list_init(&client->connected_peer_refs);
-        lantern_string_list_reset(&client->inbound_peer_ids);
-        lantern_string_list_init(&client->inbound_peer_ids);
         connection_peer_refs_reset_locked(client);
         pthread_mutex_unlock(&client->connection_lock);
     }
     else
     {
         client->connected_peers = 0;
-        lantern_string_list_reset(&client->connected_peer_ids);
-        lantern_string_list_init(&client->connected_peer_ids);
-        lantern_string_list_reset(&client->connected_peer_refs);
-        lantern_string_list_init(&client->connected_peer_refs);
-        lantern_string_list_reset(&client->inbound_peer_ids);
-        lantern_string_list_init(&client->inbound_peer_ids);
         connection_peer_refs_reset_locked(client);
     }
 }
@@ -490,59 +489,55 @@ void connection_counter_update(
     size_t refs = 0;
     if (pthread_mutex_lock(&client->connection_lock) == 0)
     {
-        if (!peer_text[0] && delta < 0
-            && connection_peer_ref_lookup_locked(client, conn, &cached_peer, &was_inbound))
+        struct lantern_connection_peer_ref *existing =
+            connection_peer_ref_find_locked(client, conn);
+        if (delta < 0 && existing)
         {
+            cached_peer = existing->peer;
             effective_peer = &cached_peer;
+            was_inbound = existing->inbound;
             format_peer_id_text(effective_peer, peer_text, sizeof(peer_text));
         }
-        if (peer_text[0])
+        if (effective_peer && effective_peer->len > 0u)
         {
             if (delta > 0)
             {
-                (void)connection_peer_ref_remember_locked(client, conn, effective_peer, inbound);
-                (void)lantern_string_list_append(&client->connected_peer_refs, peer_text);
-                if (!string_list_contains(&client->connected_peer_ids, peer_text))
+                bool peer_was_connected = connection_peer_exists_locked(client, effective_peer);
+                struct lantern_peer_id previous_peer = {0};
+                bool peer_changed = existing
+                    && !lantern_peer_id_equal(&existing->peer, effective_peer);
+                if (peer_changed)
                 {
-                    (void)lantern_string_list_append(&client->connected_peer_ids, peer_text);
+                    previous_peer = existing->peer;
                 }
-                if (inbound)
+                if (connection_peer_ref_remember_locked(client, conn, effective_peer, inbound) == 0)
                 {
-                    if (!string_list_contains(&client->inbound_peer_ids, peer_text))
+                    if (!peer_was_connected)
                     {
-                        (void)lantern_string_list_append(&client->inbound_peer_ids, peer_text);
+                        client->connected_peers += 1u;
+                    }
+                    if (peer_changed && !connection_peer_exists_locked(client, &previous_peer)
+                        && client->connected_peers > 0u)
+                    {
+                        client->connected_peers -= 1u;
                     }
                 }
-                else
-                {
-                    /* Keep an existing inbound mark while any connection for
-                     * the peer remains; c-lean-libp2p close events do not
-                     * expose the original connection direction. */
-                }
             }
-            else if (delta < 0)
+            else if (delta < 0 && existing)
             {
-                if (string_list_contains(&client->connected_peer_ids, peer_text))
+                connection_peer_ref_remove_locked(client, conn);
+                if (!connection_peer_exists_locked(client, effective_peer))
                 {
-                    was_inbound = string_list_contains(&client->inbound_peer_ids, peer_text);
-                    string_list_remove(&client->connected_peer_refs, peer_text);
-                    connection_peer_ref_remove_locked(client, conn);
-                    if (!string_list_contains(&client->connected_peer_refs, peer_text))
+                    if (client->connected_peers > 0u)
                     {
-                        string_list_remove(&client->connected_peer_ids, peer_text);
-                        string_list_remove(&client->inbound_peer_ids, peer_text);
-                        record_disconnect = true;
+                        client->connected_peers -= 1u;
                     }
+                    record_disconnect = true;
                 }
             }
-            client->connected_peers = client->connected_peer_ids.len;
-        }
-        else
-        {
-            client->connected_peers = client->connected_peer_ids.len;
         }
         total = client->connected_peers;
-        refs = client->connected_peer_refs.len;
+        refs = client->connection_peer_ref_count;
         pthread_mutex_unlock(&client->connection_lock);
     }
     else
@@ -609,6 +604,11 @@ bool lantern_client_is_peer_connected(struct lantern_client *client, const char 
     {
         return false;
     }
+    struct lantern_peer_id peer;
+    if (lantern_peer_id_from_text(peer_id, &peer) != 0)
+    {
+        return false;
+    }
     bool connected = false;
     if (client->connection_lock_initialized)
     {
@@ -616,7 +616,7 @@ bool lantern_client_is_peer_connected(struct lantern_client *client, const char 
         {
             return false;
         }
-        connected = string_list_contains(&client->connected_peer_ids, peer_id);
+        connected = connection_peer_exists_locked(client, &peer);
         pthread_mutex_unlock(&client->connection_lock);
     }
     return connected;
@@ -689,7 +689,15 @@ void request_status_now(struct lantern_client *client, const struct lantern_peer
             "status guard disabled; allowing concurrent request");
     }
 
-    int status_rc = lantern_reqresp_service_request_status(&client->reqresp, peer, status_peer);
+    struct lantern_peer_id resolved_peer;
+    const struct lantern_peer_id *peer_arg = peer;
+    if (!peer_arg && status_peer
+        && lantern_peer_id_from_text(status_peer, &resolved_peer) == 0)
+    {
+        peer_arg = &resolved_peer;
+    }
+
+    int status_rc = lantern_reqresp_service_request_status(&client->reqresp, peer_arg, status_peer);
     if (status_peer)
     {
         const char *msg = (status_rc == 0)
@@ -844,45 +852,15 @@ void identify_dial_multiaddr(
 }
 
 
-/* ============================================================================
- * Peer Dialer Sleep
- * ============================================================================ */
-
 /**
- * Sleep for a number of seconds, checking stop flag periodically.
- *
- * @param client   Client instance
- * @param seconds  Number of seconds to sleep
- *
- * @note Thread safety: This function is thread-safe
- */
-void peer_dialer_sleep(struct lantern_client *client, unsigned seconds)
-{
-    if (!client || seconds == 0u)
-    {
-        return;
-    }
-    struct timespec req = {.tv_sec = 1, .tv_nsec = 0};
-    for (unsigned i = 0; i < seconds; ++i)
-    {
-        if (__atomic_load_n(&client->dialer_stop_flag, __ATOMIC_RELAXED) != 0)
-        {
-            break;
-        }
-        (void)nanosleep(&req, NULL);
-    }
-}
-
-
-/**
- * Attempt to redial a peer that disconnected due to timeout.
+ * Attempt to redial a disconnected genesis peer.
  *
  * @param client  Client instance
  * @param peer    Peer ID to redial
  *
  * @note Thread safety: This function acquires connection_lock
  */
-void redial_peer_on_timeout(struct lantern_client *client, const struct lantern_peer_id *peer)
+void redial_peer(struct lantern_client *client, const struct lantern_peer_id *peer)
 {
     if (!client || !client->network.host || !peer)
     {
@@ -941,7 +919,7 @@ void redial_peer_on_timeout(struct lantern_client *client, const struct lantern_
                     .validator = client->node_id,
                     .peer = peer_text[0] ? peer_text : NULL,
                 },
-                "redialing peer after disconnect addr=%s",
+                "redialing peer addr=%s",
                 multiaddr);
 
             (void)lantern_libp2p_host_dial_multiaddr(&client->network, multiaddr);
@@ -959,61 +937,6 @@ void redial_peer_on_timeout(struct lantern_client *client, const struct lantern_
         },
         "peer not in genesis ENRs, skipping redial");
 }
-
-/* Redial a peer by text peer id after req/resp observes that it is disconnected. */
-void lantern_client_redial_peer_by_text(struct lantern_client *client, const char *peer_id_text)
-{
-    if (!client || !client->network.host || !peer_id_text || !peer_id_text[0])
-    {
-        return;
-    }
-    if (lantern_client_is_peer_connected(client, peer_id_text))
-    {
-        return;
-    }
-    const struct lantern_enr_record_list *enrs = &client->genesis.enrs;
-    if (!enrs || enrs->count == 0)
-    {
-        return;
-    }
-    for (size_t idx = 0; idx < enrs->count; ++idx)
-    {
-        const struct lantern_enr_record *record = &enrs->records[idx];
-        if (!record || !record->encoded)
-        {
-            continue;
-        }
-        char multiaddr[256];
-        struct lantern_peer_id enr_peer_id;
-        if (lantern_libp2p_enr_to_multiaddr(
-                record,
-                multiaddr,
-                sizeof(multiaddr),
-                &enr_peer_id)
-            != 0)
-        {
-            continue;
-        }
-        char enr_peer_text[128];
-        format_peer_id_text(&enr_peer_id, enr_peer_text, sizeof(enr_peer_text));
-        if (!enr_peer_text[0] || strcmp(enr_peer_text, peer_id_text) != 0)
-        {
-            continue;
-        }
-        lantern_log_info(
-            "network",
-            &(const struct lantern_log_metadata){
-                .validator = client->node_id,
-                .peer = peer_id_text,
-            },
-            "redialing peer after reqresp failure addr=%s",
-            multiaddr);
-        (void)lantern_libp2p_host_dial_multiaddr(&client->network, multiaddr);
-        identify_dial_multiaddr(client, multiaddr, peer_id_text);
-        return;
-    }
-}
-
 
 /* ============================================================================
  * Peer Dialer Helpers
@@ -1040,13 +963,22 @@ static size_t snapshot_connected_peers(
     size_t connected_unique = 0;
     if (pthread_mutex_lock(&client->connection_lock) == 0)
     {
-        connected_unique = client->connected_peer_ids.len;
-        if (lantern_string_list_copy(out_snapshot, &client->connected_peer_ids) != 0)
+        for (size_t i = 0; i < client->connection_peer_ref_count; ++i)
         {
-            lantern_string_list_reset(out_snapshot);
-            lantern_string_list_init(out_snapshot);
-            connected_unique = client->connected_peers;
+            char peer_text[128];
+            format_peer_id_text(
+                &client->connection_peer_refs[i].peer,
+                peer_text,
+                sizeof(peer_text));
+            if (peer_text[0] && !string_list_contains(out_snapshot, peer_text)
+                && lantern_string_list_append(out_snapshot, peer_text) != 0)
+            {
+                lantern_string_list_reset(out_snapshot);
+                lantern_string_list_init(out_snapshot);
+                break;
+            }
         }
+        connected_unique = client->connected_peers;
         pthread_mutex_unlock(&client->connection_lock);
     }
     else
@@ -1245,34 +1177,37 @@ void peer_status_refresh(struct lantern_client *client)
 }
 
 
-/**
- * Peer dialer thread function.
- *
- * @param arg  Client instance as void pointer
- * @return NULL
- *
- * @note Thread safety: This function runs in its own thread
- */
-static void *peer_dialer_thread(void *arg)
+void peer_maintenance_drive(
+    struct lantern_libp2p_host *network,
+    libp2p_host_time_us_t now_us,
+    void *user_data)
 {
-    struct lantern_client *client = (struct lantern_client *)arg;
-    if (!client)
+    (void)network;
+    struct lantern_client *client = (struct lantern_client *)user_data;
+    if (!client || __atomic_load_n(&client->dialer_stop_flag, __ATOMIC_ACQUIRE) != 0)
     {
-        return NULL;
+        return;
     }
 
-    while (__atomic_load_n(&client->dialer_stop_flag, __ATOMIC_RELAXED) == 0)
+    libp2p_host_time_us_t next_us =
+        __atomic_load_n(&client->peer_maintenance_next_us, __ATOMIC_RELAXED);
+    if (next_us != 0 && now_us < next_us)
     {
-        peer_dialer_attempt(client);
-        peer_status_refresh(client);
-        peer_dialer_sleep(client, LANTERN_PEER_DIAL_INTERVAL_SECONDS);
+        return;
     }
-    return NULL;
+
+    const libp2p_host_time_us_t interval_us =
+        (libp2p_host_time_us_t)LANTERN_PEER_DIAL_INTERVAL_SECONDS * 1000000u;
+    next_us = now_us > UINT64_MAX - interval_us ? UINT64_MAX : now_us + interval_us;
+    __atomic_store_n(&client->peer_maintenance_next_us, next_us, __ATOMIC_RELAXED);
+
+    peer_dialer_attempt(client);
+    peer_status_refresh(client);
 }
 
 
 /**
- * Start the peer dialer service.
+ * Enable periodic peer maintenance on the libp2p drive thread.
  *
  * @param client  Client instance
  * @return 0 on success, -1 on failure
@@ -1285,24 +1220,18 @@ int start_peer_dialer(struct lantern_client *client)
     {
         return -1;
     }
-    if (client->dialer_thread_started)
+    if (__atomic_load_n(&client->dialer_stop_flag, __ATOMIC_ACQUIRE) == 0)
     {
         return 0;
     }
-    __atomic_store_n(&client->dialer_stop_flag, 0, __ATOMIC_RELAXED);
-    int rc = pthread_create(&client->dialer_thread, NULL, peer_dialer_thread, client);
-    if (rc != 0)
-    {
-        __atomic_store_n(&client->dialer_stop_flag, 1, __ATOMIC_RELAXED);
-        return -1;
-    }
-    client->dialer_thread_started = true;
+    __atomic_store_n(&client->peer_maintenance_next_us, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&client->dialer_stop_flag, 0, __ATOMIC_RELEASE);
     return 0;
 }
 
 
 /**
- * Stop the peer dialer service.
+ * Disable periodic peer maintenance.
  *
  * @param client  Client instance
  *
@@ -1314,14 +1243,7 @@ void stop_peer_dialer(struct lantern_client *client)
     {
         return;
     }
-    if (!client->dialer_thread_started)
-    {
-        __atomic_store_n(&client->dialer_stop_flag, 1, __ATOMIC_RELAXED);
-        return;
-    }
-    __atomic_store_n(&client->dialer_stop_flag, 1, __ATOMIC_RELAXED);
-    (void)pthread_join(client->dialer_thread, NULL);
-    client->dialer_thread_started = false;
+    __atomic_store_n(&client->dialer_stop_flag, 1, __ATOMIC_RELEASE);
 }
 
 
@@ -1441,7 +1363,7 @@ static void handle_connection_closed_event(
 
     if (reason != LIBP2P_HOST_OK)
     {
-        redial_peer_on_timeout(client, peer);
+        redial_peer(client, peer);
     }
 }
 

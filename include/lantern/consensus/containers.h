@@ -26,6 +26,10 @@
 #ifndef LANTERN_INVERSE_PROOF_SIZE
 #define LANTERN_INVERSE_PROOF_SIZE 2u
 #endif
+/* Match ethlambda's default recursive aggregation child cap. */
+#ifndef LANTERN_MAX_AGGREGATION_CHILDREN
+#define LANTERN_MAX_AGGREGATION_CHILDREN 2u
+#endif
 
 struct lantern_bitlist {
     uint8_t *bytes;
@@ -46,12 +50,6 @@ typedef struct {
 } LanternSignature;
 
 typedef uint64_t LanternValidatorIndex;
-
-typedef struct {
-    LanternValidatorIndex *data;
-    size_t length;
-    size_t capacity;
-} LanternValidatorIndices;
 
 typedef struct {
     uint64_t num_validators;
@@ -171,20 +169,10 @@ void lantern_attestations_reset(LanternAttestations *list);
 int lantern_attestations_append(LanternAttestations *list, const LanternVote *vote);
 int lantern_attestations_resize(LanternAttestations *list, size_t new_length);
 
-void lantern_validator_indices_init(LanternValidatorIndices *indices);
-void lantern_validator_indices_reset(LanternValidatorIndices *indices);
-int lantern_validator_indices_append(LanternValidatorIndices *indices, LanternValidatorIndex index);
-int lantern_validator_indices_resize(LanternValidatorIndices *indices, size_t new_length);
 int lantern_validator_index_compute_subnet_id(
     LanternValidatorIndex index,
     size_t num_committees,
     size_t *out_subnet_id);
-int lantern_aggregation_bits_from_validator_indices(
-    struct lantern_bitlist *out_bits,
-    const LanternValidatorIndices *indices);
-int lantern_aggregation_bits_to_validator_indices(
-    const struct lantern_bitlist *bits,
-    LanternValidatorIndices *out_indices);
 
 void lantern_bitlist_init(struct lantern_bitlist *list);
 void lantern_bitlist_reset(struct lantern_bitlist *list);

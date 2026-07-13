@@ -89,34 +89,6 @@ struct lantern_peer_status_entry
     uint32_t consecutive_ping_failures;   /**< Count of consecutive ping failures */
 };
 
-/**
- * Block request context for async operations.
- *
- * @spec subspecs/networking/reqresp.py - blocks by root request
- */
-struct block_request_ctx
-{
-    struct lantern_client *client;  /**< Client instance */
-    uint64_t request_id;            /**< Internal request tracking ID */
-    struct lantern_peer_id *peer_id;             /**< Peer ID structure */
-    char peer_text[128];            /**< Peer ID as text */
-    LanternRoot *roots;             /**< Roots being requested */
-    uint32_t *depths;               /**< Backfill depth per root */
-    size_t root_count;              /**< Number of roots requested */
-    const char *protocol_id;        /**< Protocol ID string */
-};
-
-
-/**
- * Block request worker thread arguments.
- */
-struct block_request_worker_args
-{
-    struct block_request_ctx *ctx;  /**< Request context */
-    struct lantern_reqresp_stream *stream;        /**< libp2p stream */
-};
-
-
 /* ============================================================================
  * Peer Status Functions
  * ============================================================================ */
@@ -155,20 +127,6 @@ struct lantern_peer_status_entry *lantern_client_find_status_entry_locked(
  * @note Thread safety: Caller must hold status_lock
  */
 struct lantern_peer_status_entry *lantern_client_ensure_status_entry_locked(
-    struct lantern_client *client,
-    const char *peer_id);
-
-
-/**
- * Find a peer vote metric entry by peer ID.
- *
- * @param client   Client instance
- * @param peer_id  Peer ID to find
- * @return Pointer to entry if found, NULL otherwise
- *
- * @note Thread safety: Caller must hold peer_vote_lock
- */
-struct lantern_peer_vote_metric *lantern_client_find_vote_metric_locked(
     struct lantern_client *client,
     const char *peer_id);
 
@@ -278,18 +236,14 @@ void lantern_client_status_request_failed(
  *
  * @param client   Client instance
  * @param entry    Peer status entry to update
- * @param peer_id  Peer ID for logging
  * @param delta    Change to apply (+1 for start, -1 for complete)
- * @param phase    Phase name for logging
  *
  * @note Thread safety: Caller must hold status_lock
  */
 void lantern_client_status_request_update_locked(
     struct lantern_client *client,
     struct lantern_peer_status_entry *entry,
-    const char *peer_id,
-    int delta,
-    const char *phase);
+    int delta);
 
 
 /* ============================================================================
@@ -396,35 +350,14 @@ void identify_dial_multiaddr(struct lantern_client *client, const char *multiadd
 
 
 /**
- * Sleep for a number of seconds, checking stop flag periodically.
- *
- * @param client   Client instance
- * @param seconds  Number of seconds to sleep
- *
- * @note Thread safety: This function is thread-safe
- */
-void peer_dialer_sleep(struct lantern_client *client, unsigned seconds);
-
-
-/**
- * Attempt to redial a peer that disconnected due to timeout.
+ * Attempt to redial a disconnected genesis peer.
  *
  * @param client  Client instance
  * @param peer    Peer ID to redial
  *
  * @note Thread safety: This function acquires connection_lock
  */
-void redial_peer_on_timeout(struct lantern_client *client, const struct lantern_peer_id *peer);
-
-
-/**
- * Redial a peer by text peer id after req/resp observes that it is disconnected.
- *
- * @param client        Client instance
- * @param peer_id_text  Text form of the peer id to redial
- */
-void lantern_client_redial_peer_by_text(struct lantern_client *client, const char *peer_id_text);
-
+void redial_peer(struct lantern_client *client, const struct lantern_peer_id *peer);
 
 /**
  * Attempt to dial peers from genesis ENRs.
@@ -439,9 +372,15 @@ void peer_dialer_attempt(struct lantern_client *client);
 
 void peer_status_refresh(struct lantern_client *client);
 
+/** Run periodic dialing and status refresh work from the libp2p drive thread. */
+void peer_maintenance_drive(
+    struct lantern_libp2p_host *network,
+    libp2p_host_time_us_t now_us,
+    void *user_data);
+
 
 /**
- * Start the peer dialer service.
+ * Enable periodic peer maintenance on the libp2p drive thread.
  *
  * @param client  Client instance
  * @return 0 on success, -1 on failure
@@ -452,7 +391,7 @@ int start_peer_dialer(struct lantern_client *client);
 
 
 /**
- * Stop the peer dialer service.
+ * Disable periodic peer maintenance.
  *
  * @param client  Client instance
  *
