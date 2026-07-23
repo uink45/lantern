@@ -11,7 +11,6 @@
  *       3. pending_lock
  *       4. validator_lock
  *       5. connection_lock
- *       6. peer_vote_lock
  */
 
 #include "client_internal.h"
@@ -65,17 +64,18 @@ static lean_metrics_direction_t metrics_direction_from_inbound(bool inbound)
     return inbound ? LEAN_METRICS_DIR_INBOUND : LEAN_METRICS_DIR_OUTBOUND;
 }
 
-static lean_metrics_connection_result_t metrics_connection_result_from_code(int code)
+static lean_metrics_disconnection_reason_t metrics_disconnection_reason_from_close(
+    int reason,
+    bool locally_initiated,
+    uint64_t transport_error_code)
 {
-    (void)code;
-    return LEAN_METRICS_CONN_RESULT_ERROR;
-}
-
-static lean_metrics_disconnection_reason_t metrics_disconnection_reason_from_code(int reason)
-{
-    if (reason == LIBP2P_HOST_OK)
+    if (locally_initiated)
     {
         return LEAN_METRICS_DISCONNECT_LOCAL_CLOSE;
+    }
+    if (transport_error_code != 0U)
+    {
+        return LEAN_METRICS_DISCONNECT_ERROR;
     }
     if (reason == LIBP2P_HOST_ERR_CLOSED)
     {
@@ -463,6 +463,8 @@ void connection_counter_reset(struct lantern_client *client)
  * @param peer     Peer ID (may be NULL)
  * @param inbound  True if inbound connection
  * @param reason   Connection close reason code
+ * @param locally_initiated  True if the local host requested the close
+ * @param transport_error_code  Transport-specific close error code
  *
  * @note Thread safety: This function acquires connection_lock
  */
@@ -472,7 +474,9 @@ void connection_counter_update(
     const void *conn,
     const struct lantern_peer_id *peer,
     bool inbound,
-    int reason)
+    int reason,
+    bool locally_initiated,
+    uint64_t transport_error_code)
 {
     if (!client || !client->connection_lock_initialized)
     {
@@ -580,7 +584,10 @@ void connection_counter_update(
     {
         lean_metrics_record_peer_disconnection(
             metrics_direction_from_inbound(was_inbound),
-            metrics_disconnection_reason_from_code(reason));
+            metrics_disconnection_reason_from_close(
+                reason,
+                locally_initiated,
+                transport_error_code));
     }
 }
 
@@ -638,7 +645,7 @@ bool lantern_client_is_peer_connected(struct lantern_client *client, const char 
  */
 void request_status_now(struct lantern_client *client, const struct lantern_peer_id *peer, const char *peer_text)
 {
-    if (!client || !client->reqresp_running)
+    if (!client || !client->reqresp.network)
     {
         return;
     }
@@ -668,8 +675,7 @@ void request_status_now(struct lantern_client *client, const struct lantern_peer
     };
 
     bool guard_claimed = false;
-    bool guard_enabled = !client->status_guard_disabled;
-    if (status_peer && client->status_lock_initialized && guard_enabled)
+    if (status_peer && client->status_lock_initialized)
     {
         guard_claimed = lantern_client_try_begin_status_request(client, status_peer);
         if (!guard_claimed)
@@ -681,14 +687,6 @@ void request_status_now(struct lantern_client *client, const struct lantern_peer
             return;
         }
     }
-    else if (status_peer && client->status_guard_disabled)
-    {
-        lantern_log_debug(
-            "reqresp",
-            &meta,
-            "status guard disabled; allowing concurrent request");
-    }
-
     struct lantern_peer_id resolved_peer;
     const struct lantern_peer_id *peer_arg = peer;
     if (!peer_arg && status_peer
@@ -725,16 +723,9 @@ void request_status_now(struct lantern_client *client, const struct lantern_peer
                 .validator = client->node_id},
             "initiated status request to peer");
     }
-    if (status_peer)
+    if (status_peer && status_rc != 0)
     {
-        if (status_rc == 0)
-        {
-            lantern_client_note_status_request_start(client, status_peer);
-        }
-        else
-        {
-            lantern_client_status_request_failed(client, status_peer);
-        }
+        lantern_client_status_request_failed(client, status_peer);
     }
 }
 
@@ -970,8 +961,7 @@ static size_t snapshot_connected_peers(
                 &client->connection_peer_refs[i].peer,
                 peer_text,
                 sizeof(peer_text));
-            if (peer_text[0] && !string_list_contains(out_snapshot, peer_text)
-                && lantern_string_list_append(out_snapshot, peer_text) != 0)
+            if (lantern_string_list_append_unique(out_snapshot, peer_text) != 0)
             {
                 lantern_string_list_reset(out_snapshot);
                 lantern_string_list_init(out_snapshot);
@@ -1076,7 +1066,8 @@ static void peer_dialer_handle_record(
     char peer_text[128];
     format_peer_id_text(&peer_id, peer_text, sizeof(peer_text));
 
-    if (peer_text[0] && connected_snapshot && string_list_contains(connected_snapshot, peer_text))
+    if (peer_text[0] && connected_snapshot
+        && lantern_string_list_contains(connected_snapshot, peer_text))
     {
         return;
     }
@@ -1090,11 +1081,6 @@ static void peer_dialer_handle_record(
 
     const char *peer_label = peer_text[0] ? peer_text : record->encoded;
     identify_dial_multiaddr(client, multiaddr, peer_label);
-
-    if (peer_text[0] && !string_list_contains(&client->dialer_peers, peer_text))
-    {
-        (void)lantern_string_list_append(&client->dialer_peers, peer_text);
-    }
 }
 
 
@@ -1151,7 +1137,7 @@ cleanup:
 
 void peer_status_refresh(struct lantern_client *client)
 {
-    if (!client || !client->reqresp_running)
+    if (!client || !client->reqresp.network)
     {
         return;
     }
@@ -1188,6 +1174,8 @@ void peer_maintenance_drive(
     {
         return;
     }
+
+    lantern_client_drive_block_fetch_retries(client, now_us);
 
     libp2p_host_time_us_t next_us =
         __atomic_load_n(&client->peer_maintenance_next_us, __ATOMIC_RELAXED);
@@ -1271,7 +1259,7 @@ static void handle_connection_opened_event(
         return;
     }
 
-    connection_counter_update(client, 1, conn, peer, inbound, 0);
+    connection_counter_update(client, 1, conn, peer, inbound, 0, false, 0U);
 
     if (!peer)
     {
@@ -1316,6 +1304,7 @@ static void handle_connection_closed_event(
     const void *conn,
     const struct lantern_peer_id *peer,
     int reason,
+    bool locally_initiated,
     uint64_t app_error_code,
     uint64_t transport_error_code)
 {
@@ -1324,7 +1313,15 @@ static void handle_connection_closed_event(
         return;
     }
 
-    connection_counter_update(client, -1, conn, peer, false, reason);
+    connection_counter_update(
+        client,
+        -1,
+        conn,
+        peer,
+        false,
+        reason,
+        locally_initiated,
+        transport_error_code);
 
     if (!peer)
     {
@@ -1338,12 +1335,23 @@ static void handle_connection_closed_event(
         .validator = client->node_id,
         .peer = peer_text[0] ? peer_text : NULL,
     };
-    if (reason == LIBP2P_HOST_OK && peer_still_connected)
+    if (locally_initiated && peer_still_connected)
     {
         lantern_log_debug(
             "network",
             &meta,
             "duplicate connection closed reason=%d (%s) app_error=%" PRIu64 " transport_error=%" PRIu64,
+            reason,
+            connection_reason_text(reason),
+            app_error_code,
+            transport_error_code);
+    }
+    else if (locally_initiated)
+    {
+        lantern_log_debug(
+            "network",
+            &meta,
+            "local connection closed reason=%d (%s) app_error=%" PRIu64 " transport_error=%" PRIu64,
             reason,
             connection_reason_text(reason),
             app_error_code,
@@ -1361,10 +1369,15 @@ static void handle_connection_closed_event(
             transport_error_code);
     }
 
-    if (reason != LIBP2P_HOST_OK)
+    if (connection_close_should_redial(reason, locally_initiated))
     {
         redial_peer(client, peer);
     }
+}
+
+bool connection_close_should_redial(int reason, bool locally_initiated)
+{
+    return !locally_initiated && reason != LIBP2P_HOST_OK;
 }
 
 
@@ -1409,7 +1422,7 @@ static void handle_outgoing_connection_error_event(
 
     lean_metrics_record_peer_connection(
         LEAN_METRICS_DIR_OUTBOUND,
-        metrics_connection_result_from_code(code));
+        LEAN_METRICS_CONN_RESULT_ERROR);
 }
 
 
@@ -1475,6 +1488,7 @@ void connection_events_cb(
                 evt->conn,
                 peer_ptr,
                 (int)evt->reason,
+                evt->locally_initiated != 0U,
                 evt->app_error_code,
                 evt->transport_error_code);
             break;

@@ -2,7 +2,9 @@
 #include "lantern/consensus/hash.h"
 #include "lantern/consensus/signature.h"
 #include "lantern/consensus/state.h"
+#include "lantern/consensus/store.h"
 #include "lantern/metrics/lean_metrics.h"
+#include "../support/validator_registry.h"
 
 #include "pq-bindings-c-rust.h"
 
@@ -484,7 +486,8 @@ static int test_recursive_aggregated_signature_roundtrip(void) {
         }
     }
 
-    if (lantern_state_set_validator_pubkeys(&state, flattened_pubkeys, kSignerCount) != 0) {
+    if (lantern_state_generate_genesis(&state, 0u, kSignerCount) != 0
+        || lantern_test_state_set_validator_pubkeys(&state, flattened_pubkeys, kSignerCount) != 0) {
         fprintf(stderr, "recursive aggregate: state pubkey setup failed\n");
         goto fail;
     }
@@ -711,7 +714,7 @@ static int test_block_type2_attestation_split_roundtrip(void) {
     LanternRoot block_root;
     LanternState state;
     LanternSignedBlock signed_block;
-    LanternAttestationSignatures block_attestation_proofs;
+    struct lantern_aggregated_payload_pool block_attestation_payloads = {0};
     LanternAggregatedSignatureProof attestation_proof_0;
     LanternAggregatedSignatureProof attestation_proof_1;
     LanternAggregatedSignatureProof proposer_proof;
@@ -730,7 +733,6 @@ static int test_block_type2_attestation_split_roundtrip(void) {
 
     lantern_state_init(&state);
     lantern_signed_block_init(&signed_block);
-    lantern_attestation_signatures_init(&block_attestation_proofs);
     lantern_aggregated_signature_proof_init(&attestation_proof_0);
     lantern_aggregated_signature_proof_init(&attestation_proof_1);
     lantern_aggregated_signature_proof_init(&proposer_proof);
@@ -758,7 +760,8 @@ static int test_block_type2_attestation_split_roundtrip(void) {
             LANTERN_VALIDATOR_PUBKEY_SIZE);
     }
 
-    if (lantern_state_set_validator_pubkeys(&state, flattened_pubkeys, kValidatorCount) != 0) {
+    if (lantern_state_generate_genesis(&state, 0u, kValidatorCount) != 0
+        || lantern_test_state_set_validator_pubkeys(&state, flattened_pubkeys, kValidatorCount) != 0) {
         fprintf(stderr, "block split: state pubkey setup failed\n");
         goto cleanup;
     }
@@ -865,9 +868,19 @@ static int test_block_type2_attestation_split_roundtrip(void) {
             goto cleanup;
         }
     }
-    if (lantern_attestation_signatures_append(&block_attestation_proofs, &attestation_proof_0) != 0
-        || lantern_attestation_signatures_append(&block_attestation_proofs, &attestation_proof_1) != 0) {
-        fprintf(stderr, "block split: block proof list setup failed\n");
+    if (lantern_aggregated_payload_pool_add(
+            &block_attestation_payloads,
+            &attestation_roots[0],
+            &signed_block.block.body.attestations.data[0].data,
+            &attestation_proof_0)
+            != 0
+        || lantern_aggregated_payload_pool_add(
+               &block_attestation_payloads,
+               &attestation_roots[1],
+               &signed_block.block.body.attestations.data[1].data,
+               &attestation_proof_1)
+            != 0) {
+        fprintf(stderr, "block split: block payload setup failed\n");
         goto cleanup;
     }
 
@@ -905,7 +918,7 @@ static int test_block_type2_attestation_split_roundtrip(void) {
     if (!lantern_signature_merge_block_type2_proof(
             &state,
             &signed_block.block,
-            &block_attestation_proofs,
+            &block_attestation_payloads,
             &proposer_proof,
             &signed_block.proof)) {
         fprintf(stderr, "block split: type-2 merge failed\n");
@@ -968,7 +981,7 @@ cleanup:
     lantern_aggregated_signature_proof_reset(&proposer_proof);
     lantern_aggregated_signature_proof_reset(&attestation_proof_1);
     lantern_aggregated_signature_proof_reset(&attestation_proof_0);
-    lantern_attestation_signatures_reset(&block_attestation_proofs);
+    lantern_aggregated_payload_pool_reset(&block_attestation_payloads);
     lantern_signed_block_reset(&signed_block);
     lantern_state_reset(&state);
     return rc;
